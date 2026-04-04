@@ -1,0 +1,8 @@
+datasets/
+train_list.txt
+val_list.txt
+train_log.txt
+__pycache__/
+Pix2Pix/checkpoints
+Pix2Pix/train_results
+Pix2Pix/val_results

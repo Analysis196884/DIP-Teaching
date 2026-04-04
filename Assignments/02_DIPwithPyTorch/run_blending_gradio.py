@@ -1,5 +1,5 @@
 import gradio as gr
-from PIL import ImageDraw
+from PIL import Image, ImageDraw
 import numpy as np
 import torch
 
@@ -109,26 +109,38 @@ def create_mask_from_points(points, img_h, img_w):
     ### FILL: Obtain Mask from Polygon Points. 
     ### 0 indicates outside the Polygon.
     ### 255 indicates inside the Polygon.
+    if len(points) > 2:
+        pil_mask = Image.new('L', (img_w, img_h), 0)
+        draw = ImageDraw.Draw(pil_mask)
+        polygon_points = [tuple(p) for p in points]
+
+        draw.polygon(polygon_points, fill=255)
+
+        mask = np.array(pil_mask, dtype=np.uint8)
 
     return mask
 
 # Calculate the Laplacian loss between the foreground and blended image
 def cal_laplacian_loss(foreground_img, foreground_mask, blended_img, background_mask):
-    """
-    Computes the Laplacian loss between the foreground and blended images within the masks.
+    laplacian_kernel = torch.tensor([[0, 1, 0],
+                                    [1, -4, 1],
+                                    [0, 1, 0]], 
+                                    dtype=torch.float32, device=blended_img.device)
+    
+    num_channels = blended_img.shape[1]
+    laplacian_kernel_expanded = laplacian_kernel.unsqueeze(0).unsqueeze(0).repeat(num_channels, 1, 1, 1)
+    
+    lap_fg = torch.nn.functional.conv2d(foreground_img, laplacian_kernel_expanded, groups=num_channels, padding=1)
+    lap_bg = torch.nn.functional.conv2d(blended_img, laplacian_kernel_expanded, groups=num_channels, padding=1)
 
-    Args:
-        foreground_img (torch.Tensor): Foreground image tensor.
-        foreground_mask (torch.Tensor): Foreground mask tensor.
-        blended_img (torch.Tensor): Blended image tensor.
-        background_mask (torch.Tensor): Background mask tensor.
-
-    Returns:
-        torch.Tensor: The computed Laplacian loss.
-    """
-    loss = torch.tensor(0.0, device=foreground_img.device)
-    ### FILL: Compute Laplacian Loss with https://pytorch.org/docs/stable/generated/torch.nn.functional.conv2d.html.
-    ### Note: The loss is computed within the masks.
+    # Calculate squared difference and apply mask
+    squared_diff = (lap_fg - lap_bg) ** 2
+    
+    mask_expanded = foreground_mask.expand(-1, num_channels, -1, -1)
+    masked_diff = squared_diff * mask_expanded
+    
+    valid_pixel_count = torch.clamp(mask_expanded.sum(), min=1.0)
+    loss = masked_diff.sum() / valid_pixel_count
 
     return loss
 
@@ -162,17 +174,71 @@ def blending(foreground_image_original, background_image_original, dx, dy, polyg
     foreground_mask = create_mask_from_points(foreground_polygon_points, foreground_np.shape[0], foreground_np.shape[1])
     background_mask = create_mask_from_points(background_polygon_points, background_np.shape[0], background_np.shape[1])
 
-    # Convert numpy arrays to torch tensors
-    device = 'cuda:0' if torch.cuda.is_available() else 'cpu'  # Using CPU will be slow
-    fg_img_tensor = torch.from_numpy(foreground_np).to(device).permute(2, 0, 1).unsqueeze(0).float() / 255.
-    bg_img_tensor = torch.from_numpy(background_np).to(device).permute(2, 0, 1).unsqueeze(0).float() / 255.
-    fg_mask_tensor = torch.from_numpy(foreground_mask).to(device).unsqueeze(0).unsqueeze(0).float() / 255.
-    bg_mask_tensor = torch.from_numpy(background_mask).to(device).unsqueeze(0).unsqueeze(0).float() / 255.
+    # Use bounding-box ROI on background mask to accelerate optimization
+    bg_ys, bg_xs = np.where(background_mask > 0)
+    if bg_ys.size == 0 or bg_xs.size == 0:
+        return background_np
 
-    # Initialize blended image
+    bg_y0 = int(bg_ys.min())
+    bg_y1 = int(bg_ys.max()) + 1
+    bg_x0 = int(bg_xs.min())
+    bg_x1 = int(bg_xs.max()) + 1
+
+    # Include one-pixel halo for Laplacian neighborhood
+    bg_h, bg_w = background_np.shape[:2]
+    fg_h, fg_w = foreground_np.shape[:2]
+    bg_y0 = max(bg_y0 - 1, 0)
+    bg_y1 = min(bg_y1 + 1, bg_h)
+    bg_x0 = max(bg_x0 - 1, 0)
+    bg_x1 = min(bg_x1 + 1, bg_w)
+
+    # Map background ROI to corresponding foreground ROI
+    fg_y0 = bg_y0 - int(dy)
+    fg_y1 = bg_y1 - int(dy)
+    fg_x0 = bg_x0 - int(dx)
+    fg_x1 = bg_x1 - int(dx)
+
+    # Clip source ROI to foreground bounds and keep aligned destination ROI
+    if fg_y0 < 0:
+        shift = -fg_y0
+        fg_y0 = 0
+        bg_y0 += shift
+    if fg_x0 < 0:
+        shift = -fg_x0
+        fg_x0 = 0
+        bg_x0 += shift
+    if fg_y1 > fg_h:
+        shift = fg_y1 - fg_h
+        fg_y1 = fg_h
+        bg_y1 -= shift
+    if fg_x1 > fg_w:
+        shift = fg_x1 - fg_w
+        fg_x1 = fg_w
+        bg_x1 -= shift
+
+    if bg_y0 >= bg_y1 or bg_x0 >= bg_x1:
+        return background_np
+
+    # Crop ROI tensors and masks
+    foreground_roi = foreground_np[fg_y0:fg_y1, fg_x0:fg_x1]
+    background_roi = background_np[bg_y0:bg_y1, bg_x0:bg_x1]
+    foreground_mask_roi = foreground_mask[fg_y0:fg_y1, fg_x0:fg_x1]
+    background_mask_roi = background_mask[bg_y0:bg_y1, bg_x0:bg_x1]
+
+    common_mask_roi = np.logical_and(foreground_mask_roi > 0, background_mask_roi > 0).astype(np.uint8) * 255
+    if np.count_nonzero(common_mask_roi) == 0:
+        return background_np
+
+    # Convert ROI numpy arrays to torch tensors
+    device = 'cuda:0' if torch.cuda.is_available() else 'cpu'  # Using CPU will be slow
+    fg_img_tensor = torch.from_numpy(foreground_roi).to(device).permute(2, 0, 1).unsqueeze(0).float() / 255.
+    bg_img_tensor = torch.from_numpy(background_roi).to(device).permute(2, 0, 1).unsqueeze(0).float() / 255.
+    roi_mask_tensor = torch.from_numpy(common_mask_roi).to(device).unsqueeze(0).unsqueeze(0).float() / 255.
+
+    # Initialize blended ROI image
     blended_img = bg_img_tensor.clone()
-    mask_expanded = bg_mask_tensor.bool().expand(-1, 3, -1, -1)
-    blended_img[mask_expanded] = blended_img[mask_expanded] * 0.9 + fg_img_tensor[fg_mask_tensor.bool().expand(-1, 3, -1, -1)] * 0.1
+    mask_expanded = roi_mask_tensor.bool().expand(-1, bg_img_tensor.shape[1], -1, -1)
+    blended_img[mask_expanded] = blended_img[mask_expanded] * 0.9 + fg_img_tensor[roi_mask_tensor.bool().expand(-1, 3, -1, -1)] * 0.1
     blended_img.requires_grad = True
 
     # Set up optimizer
@@ -181,23 +247,30 @@ def blending(foreground_image_original, background_image_original, dx, dy, polyg
     # Optimization loop
     iter_num = 5000
     for step in range(iter_num):
-        blended_img_for_loss = blended_img.detach() * (1. - bg_mask_tensor) + blended_img * bg_mask_tensor  # Only blending in the mask region
+        blended_img_for_loss = blended_img.detach() * (1. - roi_mask_tensor) + blended_img * roi_mask_tensor
 
-        loss = cal_laplacian_loss(fg_img_tensor, fg_mask_tensor, blended_img_for_loss, bg_mask_tensor)
+        loss = cal_laplacian_loss(fg_img_tensor, roi_mask_tensor, blended_img_for_loss, roi_mask_tensor)
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
+        curr_loss = loss.item()
+
         if step % 50 == 0:
-            print(f'Optimize step: {step}, Laplacian distance loss: {loss.item()}')
+            print(f'Optimize step: {step}, Laplacian distance loss: {curr_loss}')
 
         if step == int(iter_num*2/3): ### decrease learning rate at the half step
             optimizer.param_groups[0]['lr'] *= 0.1
 
-    # Convert result back to numpy array
-    result = torch.clamp(blended_img.detach(), 0, 1).cpu().permute(0, 2, 3, 1).squeeze().numpy() * 255
-    result = result.astype(np.uint8)
+        if curr_loss < 1e-6:  # Early stopping condition
+            print(f'Converged at step {step}, Laplacian distance loss: {curr_loss}')
+            break
+
+    # Convert ROI result back and paste into full background
+    result = background_np.copy()
+    blended_roi = torch.clamp(blended_img.detach(), 0, 1).cpu().permute(0, 2, 3, 1).squeeze().numpy() * 255
+    result[bg_y0:bg_y1, bg_x0:bg_x1] = blended_roi.astype(np.uint8)
     return result
 
 # Helper function to close the polygon and reset dx
