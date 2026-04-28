@@ -6,3 +6,4 @@ __pycache__/
 Pix2Pix/checkpoints
 Pix2Pix/train_results
 Pix2Pix/val_results
+Pix2Pix/test_results
